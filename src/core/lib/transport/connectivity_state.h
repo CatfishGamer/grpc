@@ -21,13 +21,15 @@
 
 #include <grpc/support/port_platform.h>
 
+#include <map>
+#include <memory>
+
 #include "absl/status/status.h"
 
 #include <grpc/grpc.h>
 
 #include "src/core/lib/debug/trace.h"
 #include "src/core/lib/gprpp/atomic.h"
-#include "src/core/lib/gprpp/map.h"
 #include "src/core/lib/gprpp/orphanable.h"
 #include "src/core/lib/iomgr/closure.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
@@ -48,7 +50,7 @@ const char* ConnectivityStateName(grpc_connectivity_state state);
 class ConnectivityStateWatcherInterface
     : public InternallyRefCounted<ConnectivityStateWatcherInterface> {
  public:
-  virtual ~ConnectivityStateWatcherInterface() = default;
+  ~ConnectivityStateWatcherInterface() override = default;
 
   // Notifies the watcher that the state has changed to new_state.
   virtual void Notify(grpc_connectivity_state new_state,
@@ -63,18 +65,18 @@ class ConnectivityStateWatcherInterface
 class AsyncConnectivityStateWatcherInterface
     : public ConnectivityStateWatcherInterface {
  public:
-  virtual ~AsyncConnectivityStateWatcherInterface() = default;
+  ~AsyncConnectivityStateWatcherInterface() override = default;
 
   // Schedules a closure on the ExecCtx to invoke
   // OnConnectivityStateChange() asynchronously.
   void Notify(grpc_connectivity_state new_state,
-              const absl::Status& status) override final;
+              const absl::Status& status) final;
 
  protected:
   class Notifier;
 
-  // If \a combiner is nullptr, then the notification will be scheduled on the
-  // ExecCtx.
+  // If \a work_serializer is nullptr, then the notification will be scheduled
+  // on the ExecCtx.
   explicit AsyncConnectivityStateWatcherInterface(
       std::shared_ptr<WorkSerializer> work_serializer = nullptr)
       : work_serializer_(std::move(work_serializer)) {}
@@ -95,9 +97,9 @@ class AsyncConnectivityStateWatcherInterface
 // to be called).
 class ConnectivityStateTracker {
  public:
-  ConnectivityStateTracker(const char* name,
-                           grpc_connectivity_state state = GRPC_CHANNEL_IDLE,
-                           const absl::Status& status = absl::Status())
+  explicit ConnectivityStateTracker(
+      const char* name, grpc_connectivity_state state = GRPC_CHANNEL_IDLE,
+      const absl::Status& status = absl::Status())
       : name_(name), state_(state), status_(status) {}
 
   ~ConnectivityStateTracker();

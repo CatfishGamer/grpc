@@ -23,6 +23,7 @@
 #include <string>
 
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 
 #include <grpc/slice_buffer.h>
 #include <grpc/support/alloc.h>
@@ -31,6 +32,7 @@
 #include "src/core/ext/transport/chttp2/transport/bin_decoder.h"
 #include "src/core/ext/transport/chttp2/transport/bin_encoder.h"
 #include "src/core/ext/transport/chttp2/transport/incoming_metadata.h"
+#include "src/core/ext/transport/cronet/transport/cronet_status.h"
 #include "src/core/ext/transport/cronet/transport/cronet_transport.h"
 #include "src/core/lib/debug/trace.h"
 #include "src/core/lib/gpr/string.h"
@@ -115,7 +117,7 @@ typedef struct grpc_cronet_transport grpc_cronet_transport;
 /* TODO (makdharma): reorder structure for memory efficiency per
    http://www.catb.org/esr/structure-packing/#_structure_reordering: */
 struct read_state {
-  read_state(grpc_core::Arena* arena)
+  explicit read_state(grpc_core::Arena* arena)
       : trailing_metadata(arena), initial_metadata(arena) {
     grpc_slice_buffer_init(&read_slice_buffer);
   }
@@ -126,10 +128,10 @@ struct read_state {
   int received_bytes = 0;
   int remaining_bytes = 0;
   int length_field = 0;
-  bool compressed = 0;
+  bool compressed = false;
   char grpc_header_bytes[GRPC_HEADER_SIZE_IN_BYTES] = {};
   char* payload_field = nullptr;
-  bool read_stream_closed = 0;
+  bool read_stream_closed = false;
 
   /* vars for holding data destined for the application */
   grpc_core::ManualConstructor<grpc_core::SliceBufferByteStream> sbs;
@@ -149,7 +151,7 @@ struct write_state {
 
 /* track state of one stream op */
 struct op_state {
-  op_state(grpc_core::Arena* arena) : rs(arena) {}
+  explicit op_state(grpc_core::Arena* arena) : rs(arena) {}
 
   bool state_op_done[OP_NUM_OPS] = {};
   bool state_callback_received[OP_NUM_OPS] = {};
@@ -162,9 +164,8 @@ struct op_state {
   bool pending_send_message = false;
   /* User requested RECV_TRAILING_METADATA */
   bool pending_recv_trailing_metadata = false;
-  /* Cronet has not issued a callback of a bidirectional read */
-  bool pending_read_from_cronet = false;
-  grpc_error* cancel_error = GRPC_ERROR_NONE;
+  cronet_net_error_code net_error = OK;
+  grpc_error_handle cancel_error = GRPC_ERROR_NONE;
   /* data structure for storing data coming from server */
   struct read_state rs;
   /* data structure for storing data going to the server */
@@ -303,11 +304,16 @@ static void read_grpc_header(stream_obj* s) {
   CRONET_LOG(GPR_DEBUG, "bidirectional_stream_read(%p)", s->cbs);
   bidirectional_stream_read(s->cbs, s->state.rs.read_buffer,
                             s->state.rs.remaining_bytes);
-  s->state.pending_read_from_cronet = true;
 }
 
-static grpc_error* make_error_with_desc(int error_code, const char* desc) {
-  grpc_error* error = GRPC_ERROR_CREATE_FROM_COPIED_STRING(desc);
+static grpc_error_handle make_error_with_desc(int error_code,
+                                              int cronet_internal_error_code,
+                                              const char* desc) {
+  std::string error_message =
+      absl::StrFormat("Cronet error code:%d, Cronet error detail:%s",
+                      cronet_internal_error_code, desc);
+  grpc_error_handle error =
+      GRPC_ERROR_CREATE_FROM_COPIED_STRING(error_message.c_str());
   error = grpc_error_set_int(error, GRPC_ERROR_INT_GRPC_STATUS, error_code);
   return error;
 }
@@ -435,6 +441,7 @@ static void on_failed(bidirectional_stream* stream, int net_error) {
   gpr_mu_lock(&s->mu);
   bidirectional_stream_destroy(s->cbs);
   s->state.state_callback_received[OP_FAILED] = true;
+  s->state.net_error = static_cast<cronet_net_error_code>(net_error);
   s->cbs = nullptr;
   if (s->header_array.headers) {
     gpr_free(s->header_array.headers);
@@ -594,13 +601,11 @@ static void on_read_completed(bidirectional_stream* stream, char* data,
   CRONET_LOG(GPR_DEBUG, "R: on_read_completed(%p, %p, %d)", stream, data,
              count);
   gpr_mu_lock(&s->mu);
-  s->state.pending_read_from_cronet = false;
   s->state.state_callback_received[OP_RECV_MESSAGE] = true;
   if (count > 0 && s->state.flush_read) {
     CRONET_LOG(GPR_DEBUG, "bidirectional_stream_read(%p)", s->cbs);
     bidirectional_stream_read(s->cbs, s->state.rs.read_buffer,
                               GRPC_FLUSH_READ_SIZE);
-    s->state.pending_read_from_cronet = true;
     gpr_mu_unlock(&s->mu);
   } else if (count > 0) {
     s->state.rs.received_bytes += count;
@@ -611,7 +616,6 @@ static void on_read_completed(bidirectional_stream* stream, char* data,
       bidirectional_stream_read(
           s->cbs, s->state.rs.read_buffer + s->state.rs.received_bytes,
           s->state.rs.remaining_bytes);
-      s->state.pending_read_from_cronet = true;
       gpr_mu_unlock(&s->mu);
     } else {
       gpr_mu_unlock(&s->mu);
@@ -876,65 +880,81 @@ static bool op_can_be_run(grpc_transport_stream_op_batch* curr_op,
     /* already executed */
     if (stream_state->state_op_done[OP_SEND_INITIAL_METADATA]) result = false;
   } else if (op_id == OP_RECV_INITIAL_METADATA) {
-    /* already executed */
-    if (stream_state->state_op_done[OP_RECV_INITIAL_METADATA]) result = false;
-    /* we haven't sent headers yet. */
-    else if (!stream_state->state_callback_received[OP_SEND_INITIAL_METADATA])
+    if (stream_state->state_op_done[OP_RECV_INITIAL_METADATA]) {
+      /* already executed */
       result = false;
-    /* we haven't received headers yet. */
-    else if (!stream_state->state_callback_received[OP_RECV_INITIAL_METADATA] &&
-             !stream_state->state_op_done[OP_RECV_TRAILING_METADATA])
+    } else if (!stream_state
+                    ->state_callback_received[OP_SEND_INITIAL_METADATA]) {
+      /* we haven't sent headers yet. */
       result = false;
+    } else if (!stream_state
+                    ->state_callback_received[OP_RECV_INITIAL_METADATA] &&
+               !stream_state->state_op_done[OP_RECV_TRAILING_METADATA]) {
+      /* we haven't received headers yet. */
+      result = false;
+    }
   } else if (op_id == OP_SEND_MESSAGE) {
-    /* already executed (note we're checking op specific state, not stream
-     state) */
-    if (op_state->state_op_done[OP_SEND_MESSAGE]) result = false;
-    /* we haven't sent headers yet. */
-    else if (!stream_state->state_callback_received[OP_SEND_INITIAL_METADATA])
+    if (op_state->state_op_done[OP_SEND_MESSAGE]) {
+      /* already executed (note we're checking op specific state, not stream
+         state) */
       result = false;
+    } else if (!stream_state
+                    ->state_callback_received[OP_SEND_INITIAL_METADATA]) {
+      /* we haven't sent headers yet. */
+      result = false;
+    }
   } else if (op_id == OP_RECV_MESSAGE) {
-    /* already executed */
-    if (op_state->state_op_done[OP_RECV_MESSAGE]) result = false;
-    /* we haven't received headers yet. */
-    else if (!stream_state->state_callback_received[OP_RECV_INITIAL_METADATA] &&
-             !stream_state->state_op_done[OP_RECV_TRAILING_METADATA])
+    if (op_state->state_op_done[OP_RECV_MESSAGE]) {
+      /* already executed */
       result = false;
+    } else if (!stream_state
+                    ->state_callback_received[OP_RECV_INITIAL_METADATA] &&
+               !stream_state->state_op_done[OP_RECV_TRAILING_METADATA]) {
+      /* we haven't received headers yet. */
+      result = false;
+    }
   } else if (op_id == OP_RECV_TRAILING_METADATA) {
-    /* already executed */
-    if (stream_state->state_op_done[OP_RECV_TRAILING_METADATA]) result = false;
-    /* we have asked for but haven't received message yet. */
-    else if (stream_state->state_op_done[OP_READ_REQ_MADE] &&
-             !stream_state->state_op_done[OP_RECV_MESSAGE])
+    if (stream_state->state_op_done[OP_RECV_TRAILING_METADATA]) {
+      /* already executed */
       result = false;
-    /* we haven't received trailers  yet. */
-    else if (!stream_state->state_callback_received[OP_RECV_TRAILING_METADATA])
+    } else if (stream_state->state_op_done[OP_READ_REQ_MADE] &&
+               !stream_state->state_op_done[OP_RECV_MESSAGE]) {
+      /* we have asked for but haven't received message yet. */
       result = false;
-    /* we haven't received on_succeeded  yet. */
-    else if (!stream_state->state_callback_received[OP_SUCCEEDED])
+    } else if (!stream_state
+                    ->state_callback_received[OP_RECV_TRAILING_METADATA]) {
+      /* we haven't received trailers  yet. */
       result = false;
+    } else if (!stream_state->state_callback_received[OP_SUCCEEDED]) {
+      /* we haven't received on_succeeded  yet. */
+      result = false;
+    }
   } else if (op_id == OP_SEND_TRAILING_METADATA) {
-    /* already executed */
-    if (stream_state->state_op_done[OP_SEND_TRAILING_METADATA]) result = false;
-    /* we haven't sent initial metadata yet */
-    else if (!stream_state->state_callback_received[OP_SEND_INITIAL_METADATA])
+    if (stream_state->state_op_done[OP_SEND_TRAILING_METADATA]) {
+      /* already executed */
       result = false;
-    /* we haven't sent message yet */
-    else if (stream_state->pending_send_message &&
-             !stream_state->state_op_done[OP_SEND_MESSAGE])
+    } else if (!stream_state
+                    ->state_callback_received[OP_SEND_INITIAL_METADATA]) {
+      /* we haven't sent initial metadata yet */
       result = false;
-    /* we haven't got on_write_completed for the send yet */
-    else if (stream_state->state_op_done[OP_SEND_MESSAGE] &&
-             !stream_state->state_callback_received[OP_SEND_MESSAGE] &&
-             !(t->use_packet_coalescing &&
-               stream_state->pending_write_for_trailer))
+    } else if (stream_state->pending_send_message &&
+               !stream_state->state_op_done[OP_SEND_MESSAGE]) {
+      /* we haven't sent message yet */
       result = false;
+    } else if (stream_state->state_op_done[OP_SEND_MESSAGE] &&
+               !stream_state->state_callback_received[OP_SEND_MESSAGE] &&
+               !(t->use_packet_coalescing &&
+                 stream_state->pending_write_for_trailer)) {
+      /* we haven't got on_write_completed for the send yet */
+      result = false;
+    }
   } else if (op_id == OP_CANCEL_ERROR) {
     /* already executed */
     if (stream_state->state_op_done[OP_CANCEL_ERROR]) result = false;
   } else if (op_id == OP_ON_COMPLETE) {
-    /* already executed (note we're checking op specific state, not stream
-    state) */
     if (op_state->state_op_done[OP_ON_COMPLETE]) {
+      /* already executed (note we're checking op specific state, not stream
+      state) */
       CRONET_LOG(GPR_DEBUG, "Because");
       result = false;
     }
@@ -992,8 +1012,9 @@ static bool op_can_be_run(grpc_transport_stream_op_batch* curr_op,
     /* We should see at least one on_write_completed for the trailers that we
       sent */
     else if (curr_op->send_trailing_metadata &&
-             !stream_state->state_callback_received[OP_SEND_MESSAGE])
+             !stream_state->state_callback_received[OP_SEND_MESSAGE]) {
       result = false;
+    }
   }
   CRONET_LOG(GPR_DEBUG, "op_can_be_run %s : %s", op_id_string(op_id),
              result ? "YES" : "NO");
@@ -1038,8 +1059,8 @@ static enum e_op_result execute_stream_op(struct op_and_state* oas) {
     unsigned int header_index;
     for (header_index = 0; header_index < s->header_array.count;
          header_index++) {
-      gpr_free((void*)s->header_array.headers[header_index].key);
-      gpr_free((void*)s->header_array.headers[header_index].value);
+      gpr_free(const_cast<char*>(s->header_array.headers[header_index].key));
+      gpr_free(const_cast<char*>(s->header_array.headers[header_index].value));
     }
     stream_state->state_op_done[OP_SEND_INITIAL_METADATA] = true;
     if (t->use_packet_coalescing) {
@@ -1179,7 +1200,7 @@ static enum e_op_result execute_stream_op(struct op_and_state* oas) {
       stream_state->state_op_done[OP_RECV_MESSAGE] = true;
       oas->state.state_op_done[OP_RECV_MESSAGE] = true;
       result = ACTION_TAKEN_NO_CALLBACK;
-    } else if (stream_state->rs.read_stream_closed == true) {
+    } else if (stream_state->rs.read_stream_closed) {
       /* No more data will be received */
       CRONET_LOG(GPR_DEBUG, "read stream closed");
       grpc_core::ExecCtx::Run(
@@ -1196,7 +1217,7 @@ static enum e_op_result execute_stream_op(struct op_and_state* oas) {
       stream_state->state_op_done[OP_RECV_MESSAGE] = true;
       oas->state.state_op_done[OP_RECV_MESSAGE] = true;
       result = ACTION_TAKEN_NO_CALLBACK;
-    } else if (stream_state->rs.length_field_received == false) {
+    } else if (!stream_state->rs.length_field_received) {
       if (stream_state->rs.received_bytes == GRPC_HEADER_SIZE_IN_BYTES &&
           stream_state->rs.remaining_bytes == 0) {
         /* Start a read operation for data */
@@ -1217,7 +1238,6 @@ static enum e_op_result execute_stream_op(struct op_and_state* oas) {
               true; /* Indicates that at least one read request has been made */
           bidirectional_stream_read(s->cbs, stream_state->rs.read_buffer,
                                     stream_state->rs.remaining_bytes);
-          stream_state->pending_read_from_cronet = true;
           result = ACTION_TAKEN_WITH_CALLBACK;
         } else {
           stream_state->rs.remaining_bytes = 0;
@@ -1258,7 +1278,6 @@ static enum e_op_result execute_stream_op(struct op_and_state* oas) {
             true; /* Indicates that at least one read request has been made */
         bidirectional_stream_read(s->cbs, stream_state->rs.read_buffer,
                                   stream_state->rs.remaining_bytes);
-        stream_state->pending_read_from_cronet = true;
         result = ACTION_TAKEN_WITH_CALLBACK;
       } else {
         result = NO_ACTION_POSSIBLE;
@@ -1298,11 +1317,15 @@ static enum e_op_result execute_stream_op(struct op_and_state* oas) {
              op_can_be_run(stream_op, s, &oas->state,
                            OP_RECV_TRAILING_METADATA)) {
     CRONET_LOG(GPR_DEBUG, "running: %p  OP_RECV_TRAILING_METADATA", oas);
-    grpc_error* error = GRPC_ERROR_NONE;
+    grpc_error_handle error = GRPC_ERROR_NONE;
     if (stream_state->state_op_done[OP_CANCEL_ERROR]) {
       error = GRPC_ERROR_REF(stream_state->cancel_error);
     } else if (stream_state->state_callback_received[OP_FAILED]) {
-      error = make_error_with_desc(GRPC_STATUS_UNAVAILABLE, "Unavailable.");
+      grpc_status_code grpc_error_code =
+          cronet_net_error_to_grpc_error(stream_state->net_error);
+      const char* desc = cronet_net_error_as_string(stream_state->net_error);
+      error =
+          make_error_with_desc(grpc_error_code, stream_state->net_error, desc);
     } else if (oas->s->state.rs.trailing_metadata_valid) {
       grpc_chttp2_incoming_metadata_buffer_publish(
           &oas->s->state.rs.trailing_metadata,
@@ -1339,9 +1362,14 @@ static enum e_op_result execute_stream_op(struct op_and_state* oas) {
       }
     } else if (stream_state->state_callback_received[OP_FAILED]) {
       if (stream_op->on_complete) {
+        const char* error_message =
+            cronet_net_error_as_string(stream_state->net_error);
+        grpc_status_code grpc_error_code =
+            cronet_net_error_to_grpc_error(stream_state->net_error);
         grpc_core::ExecCtx::Run(
             DEBUG_LOCATION, stream_op->on_complete,
-            make_error_with_desc(GRPC_STATUS_UNAVAILABLE, "Unavailable."));
+            make_error_with_desc(grpc_error_code, stream_state->net_error,
+                                 error_message));
       }
     } else {
       /* All actions in this stream_op are complete. Call the on_complete
@@ -1363,8 +1391,9 @@ static enum e_op_result execute_stream_op(struct op_and_state* oas) {
     result = ACTION_TAKEN_NO_CALLBACK;
     /* If this is the on_complete callback being called for a received message -
       make a note */
-    if (stream_op->recv_message)
+    if (stream_op->recv_message) {
       stream_state->state_op_done[OP_RECV_MESSAGE_AND_ON_COMPLETE] = true;
+    }
   } else {
     result = NO_ACTION_POSSIBLE;
   }
@@ -1395,19 +1424,20 @@ inline stream_obj::~stream_obj() {
 }
 
 static int init_stream(grpc_transport* gt, grpc_stream* gs,
-                       grpc_stream_refcount* refcount, const void* server_data,
-                       grpc_core::Arena* arena) {
+                       grpc_stream_refcount* refcount,
+                       const void* /*server_data*/, grpc_core::Arena* arena) {
   new (gs) stream_obj(gt, gs, refcount, arena);
   return 0;
 }
 
-static void set_pollset_do_nothing(grpc_transport* gt, grpc_stream* gs,
-                                   grpc_pollset* pollset) {}
+static void set_pollset_do_nothing(grpc_transport* /*gt*/, grpc_stream* /*gs*/,
+                                   grpc_pollset* /*pollset*/) {}
 
-static void set_pollset_set_do_nothing(grpc_transport* gt, grpc_stream* gs,
-                                       grpc_pollset_set* pollset_set) {}
+static void set_pollset_set_do_nothing(grpc_transport* /*gt*/,
+                                       grpc_stream* /*gs*/,
+                                       grpc_pollset_set* /*pollset_set*/) {}
 
-static void perform_stream_op(grpc_transport* gt, grpc_stream* gs,
+static void perform_stream_op(grpc_transport* /*gt*/, grpc_stream* gs,
                               grpc_transport_stream_op_batch* op) {
   CRONET_LOG(GPR_DEBUG, "perform_stream_op");
   if (op->send_initial_metadata &&
@@ -1441,7 +1471,7 @@ static void perform_stream_op(grpc_transport* gt, grpc_stream* gs,
   execute_from_storage(s);
 }
 
-static void destroy_stream(grpc_transport* gt, grpc_stream* gs,
+static void destroy_stream(grpc_transport* /*gt*/, grpc_stream* gs,
                            grpc_closure* then_schedule_closure) {
   stream_obj* s = reinterpret_cast<stream_obj*>(gs);
   s->~stream_obj();
@@ -1449,11 +1479,11 @@ static void destroy_stream(grpc_transport* gt, grpc_stream* gs,
                           GRPC_ERROR_NONE);
 }
 
-static void destroy_transport(grpc_transport* gt) {}
+static void destroy_transport(grpc_transport* /*gt*/) {}
 
-static grpc_endpoint* get_endpoint(grpc_transport* gt) { return nullptr; }
+static grpc_endpoint* get_endpoint(grpc_transport* /*gt*/) { return nullptr; }
 
-static void perform_op(grpc_transport* gt, grpc_transport_op* op) {}
+static void perform_op(grpc_transport* /*gt*/, grpc_transport_op* /*op*/) {}
 
 static const grpc_transport_vtable grpc_cronet_vtable = {
     sizeof(stream_obj),
@@ -1469,7 +1499,7 @@ static const grpc_transport_vtable grpc_cronet_vtable = {
 
 grpc_transport* grpc_create_cronet_transport(void* engine, const char* target,
                                              const grpc_channel_args* args,
-                                             void* reserved) {
+                                             void* /*reserved*/) {
   grpc_cronet_transport* ct = static_cast<grpc_cronet_transport*>(
       gpr_malloc(sizeof(grpc_cronet_transport)));
   if (!ct) {

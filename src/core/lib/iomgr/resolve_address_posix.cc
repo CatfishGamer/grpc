@@ -42,7 +42,7 @@
 #include "src/core/lib/iomgr/iomgr_internal.h"
 #include "src/core/lib/iomgr/unix_sockets_posix.h"
 
-static grpc_error* posix_blocking_resolve_address(
+static grpc_error_handle posix_blocking_resolve_address(
     const char* name, const char* default_port,
     grpc_resolved_addresses** addresses) {
   grpc_core::ExecCtx exec_ctx;
@@ -50,12 +50,7 @@ static grpc_error* posix_blocking_resolve_address(
   struct addrinfo *result = nullptr, *resp;
   int s;
   size_t i;
-  grpc_error* err;
-
-  if (name[0] == 'u' && name[1] == 'n' && name[2] == 'i' && name[3] == 'x' &&
-      name[4] == ':' && name[5] != 0) {
-    return grpc_resolve_unix_domain_address(name + 5, addresses);
-  }
+  grpc_error_handle err;
 
   std::string host;
   std::string port;
@@ -67,6 +62,7 @@ static grpc_error* posix_blocking_resolve_address(
         GRPC_ERROR_STR_TARGET_ADDRESS, grpc_slice_from_copied_string(name));
     goto done;
   }
+
   if (port.empty()) {
     if (default_port == nullptr) {
       err = grpc_error_set_str(
@@ -149,7 +145,7 @@ struct request {
 };
 /* Callback to be passed to grpc Executor to asynch-ify
  * grpc_blocking_resolve_address */
-static void do_request_thread(void* rp, grpc_error* /*error*/) {
+static void do_request_thread(void* rp, grpc_error_handle /*error*/) {
   request* r = static_cast<request*>(rp);
   grpc_core::ExecCtx::Run(
       DEBUG_LOCATION, r->on_done,

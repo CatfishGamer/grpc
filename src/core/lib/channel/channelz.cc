@@ -19,6 +19,11 @@
 #include <grpc/impl/codegen/port_platform.h>
 
 #include "src/core/lib/channel/channelz.h"
+#include "src/core/lib/iomgr/resolve_address.h"
+#include "src/core/lib/iomgr/sockaddr_utils.h"
+
+#include "absl/strings/escaping.h"
+#include "absl/strings/strip.h"
 
 #include <grpc/grpc.h>
 #include <grpc/support/alloc.h>
@@ -47,40 +52,6 @@
 
 namespace grpc_core {
 namespace channelz {
-
-//
-// channel arg code
-//
-
-namespace {
-
-void* parent_uuid_copy(void* p) { return p; }
-void parent_uuid_destroy(void* /*p*/) {}
-int parent_uuid_cmp(void* p1, void* p2) { return GPR_ICMP(p1, p2); }
-const grpc_arg_pointer_vtable parent_uuid_vtable = {
-    parent_uuid_copy, parent_uuid_destroy, parent_uuid_cmp};
-
-}  // namespace
-
-grpc_arg MakeParentUuidArg(intptr_t parent_uuid) {
-  // We would ideally like to store the uuid in an integer argument.
-  // Unfortunately, that won't work, because intptr_t (the type used for
-  // uuids) doesn't fit in an int (the type used for integer args).
-  // So instead, we use a hack to store it as a pointer, because
-  // intptr_t should be the same size as void*.
-  static_assert(sizeof(intptr_t) <= sizeof(void*),
-                "can't fit intptr_t inside of void*");
-  return grpc_channel_arg_pointer_create(
-      const_cast<char*>(GRPC_ARG_CHANNELZ_PARENT_UUID),
-      reinterpret_cast<void*>(parent_uuid), &parent_uuid_vtable);
-}
-
-intptr_t GetParentUuidFromArgs(const grpc_channel_args& args) {
-  const grpc_arg* arg =
-      grpc_channel_args_find(&args, GRPC_ARG_CHANNELZ_PARENT_UUID);
-  if (arg == nullptr || arg->type != GRPC_ARG_POINTER) return 0;
-  return reinterpret_cast<intptr_t>(arg->value.pointer.p);
-}
 
 //
 // BaseNode
@@ -148,21 +119,21 @@ void CallCountingHelper::CollectData(CounterData* out) {
   }
 }
 
-void CallCountingHelper::PopulateCallCounts(Json::Object* object) {
+void CallCountingHelper::PopulateCallCounts(Json::Object* json) {
   CounterData data;
   CollectData(&data);
   if (data.calls_started != 0) {
-    (*object)["callsStarted"] = std::to_string(data.calls_started);
+    (*json)["callsStarted"] = std::to_string(data.calls_started);
     gpr_timespec ts = gpr_convert_clock_type(
         gpr_cycle_counter_to_time(data.last_call_started_cycle),
         GPR_CLOCK_REALTIME);
-    (*object)["lastCallStartedTimestamp"] = gpr_format_timespec(ts);
+    (*json)["lastCallStartedTimestamp"] = gpr_format_timespec(ts);
   }
   if (data.calls_succeeded != 0) {
-    (*object)["callsSucceeded"] = std::to_string(data.calls_succeeded);
+    (*json)["callsSucceeded"] = std::to_string(data.calls_succeeded);
   }
   if (data.calls_failed) {
-    (*object)["callsFailed"] = std::to_string(data.calls_failed);
+    (*json)["callsFailed"] = std::to_string(data.calls_failed);
   }
 }
 
@@ -171,13 +142,12 @@ void CallCountingHelper::PopulateCallCounts(Json::Object* object) {
 //
 
 ChannelNode::ChannelNode(std::string target, size_t channel_tracer_max_nodes,
-                         intptr_t parent_uuid)
-    : BaseNode(parent_uuid == 0 ? EntityType::kTopLevelChannel
-                                : EntityType::kInternalChannel,
+                         bool is_internal_channel)
+    : BaseNode(is_internal_channel ? EntityType::kInternalChannel
+                                   : EntityType::kTopLevelChannel,
                target),
       target_(std::move(target)),
-      trace_(channel_tracer_max_nodes),
-      parent_uuid_(parent_uuid) {}
+      trace_(channel_tracer_max_nodes) {}
 
 const char* ChannelNode::GetChannelConnectivityStateChangeString(
     grpc_connectivity_state state) {
@@ -235,18 +205,18 @@ void ChannelNode::PopulateChildRefs(Json::Object* json) {
   MutexLock lock(&child_mu_);
   if (!child_subchannels_.empty()) {
     Json::Array array;
-    for (const auto& p : child_subchannels_) {
+    for (intptr_t subchannel_uuid : child_subchannels_) {
       array.emplace_back(Json::Object{
-          {"subchannelId", std::to_string(p.first)},
+          {"subchannelId", std::to_string(subchannel_uuid)},
       });
     }
     (*json)["subchannelRef"] = std::move(array);
   }
   if (!child_channels_.empty()) {
     Json::Array array;
-    for (const auto& p : child_channels_) {
+    for (intptr_t channel_uuid : child_channels_) {
       array.emplace_back(Json::Object{
-          {"channelId", std::to_string(p.first)},
+          {"channelId", std::to_string(channel_uuid)},
       });
     }
     (*json)["channelRef"] = std::move(array);
@@ -261,7 +231,7 @@ void ChannelNode::SetConnectivityState(grpc_connectivity_state state) {
 
 void ChannelNode::AddChildChannel(intptr_t child_uuid) {
   MutexLock lock(&child_mu_);
-  child_channels_.insert(std::make_pair(child_uuid, true));
+  child_channels_.insert(child_uuid);
 }
 
 void ChannelNode::RemoveChildChannel(intptr_t child_uuid) {
@@ -271,7 +241,7 @@ void ChannelNode::RemoveChildChannel(intptr_t child_uuid) {
 
 void ChannelNode::AddChildSubchannel(intptr_t child_uuid) {
   MutexLock lock(&child_mu_);
-  child_subchannels_.insert(std::make_pair(child_uuid, true));
+  child_subchannels_.insert(child_uuid);
 }
 
 void ChannelNode::RemoveChildSubchannel(intptr_t child_uuid) {
@@ -370,6 +340,83 @@ Json ServerNode::RenderJson() {
 }
 
 //
+// SocketNode::Security::Tls
+//
+
+Json SocketNode::Security::Tls::RenderJson() {
+  Json::Object data;
+  if (type == NameType::kStandardName) {
+    data["standard_name"] = name;
+  } else if (type == NameType::kOtherName) {
+    data["other_name"] = name;
+  }
+  if (!local_certificate.empty()) {
+    data["local_certificate"] = absl::Base64Escape(local_certificate);
+  }
+  if (!remote_certificate.empty()) {
+    data["remote_certificate"] = absl::Base64Escape(remote_certificate);
+  }
+  return data;
+}
+
+//
+// SocketNode::Security
+//
+
+Json SocketNode::Security::RenderJson() {
+  Json::Object data;
+  switch (type) {
+    case ModelType::kUnset:
+      break;
+    case ModelType::kTls:
+      if (tls) {
+        data["tls"] = tls->RenderJson();
+      }
+      break;
+    case ModelType::kOther:
+      if (other) {
+        data["other"] = *other;
+      }
+      break;
+  }
+  return data;
+}
+
+namespace {
+
+void* SecurityArgCopy(void* p) {
+  SocketNode::Security* xds_certificate_provider =
+      static_cast<SocketNode::Security*>(p);
+  return xds_certificate_provider->Ref().release();
+}
+
+void SecurityArgDestroy(void* p) {
+  SocketNode::Security* xds_certificate_provider =
+      static_cast<SocketNode::Security*>(p);
+  xds_certificate_provider->Unref();
+}
+
+int SecurityArgCmp(void* p, void* q) { return GPR_ICMP(p, q); }
+
+const grpc_arg_pointer_vtable kChannelArgVtable = {
+    SecurityArgCopy, SecurityArgDestroy, SecurityArgCmp};
+
+}  // namespace
+
+grpc_arg SocketNode::Security::MakeChannelArg() const {
+  return grpc_channel_arg_pointer_create(
+      const_cast<char*>(GRPC_ARG_CHANNELZ_SECURITY),
+      const_cast<SocketNode::Security*>(this), &kChannelArgVtable);
+}
+
+RefCountedPtr<SocketNode::Security> SocketNode::Security::GetFromChannelArgs(
+    const grpc_channel_args* args) {
+  Security* security = grpc_channel_args_find_pointer<Security>(
+      args, GRPC_ARG_CHANNELZ_SECURITY);
+  return security != nullptr ? security->Ref() : nullptr;
+}
+
+//
 // SocketNode
 //
 
@@ -379,43 +426,51 @@ void PopulateSocketAddressJson(Json::Object* json, const char* name,
                                const char* addr_str) {
   if (addr_str == nullptr) return;
   Json::Object data;
-  grpc_uri* uri = grpc_uri_parse(addr_str, true);
-  if ((uri != nullptr) && ((strcmp(uri->scheme, "ipv4") == 0) ||
-                           (strcmp(uri->scheme, "ipv6") == 0))) {
-    const char* host_port = uri->path;
-    if (*host_port == '/') ++host_port;
+  absl::StatusOr<URI> uri = URI::Parse(addr_str);
+  if (uri.ok() && (uri->scheme() == "ipv4" || uri->scheme() == "ipv6")) {
     std::string host;
     std::string port;
-    GPR_ASSERT(SplitHostPort(host_port, &host, &port));
+    GPR_ASSERT(
+        SplitHostPort(absl::StripPrefix(uri->path(), "/"), &host, &port));
     int port_num = -1;
     if (!port.empty()) {
       port_num = atoi(port.data());
     }
-    char* b64_host = grpc_base64_encode(host.data(), host.size(), false, false);
-    data["tcpip_address"] = Json::Object{
-        {"port", port_num},
-        {"ip_address", b64_host},
-    };
-    gpr_free(b64_host);
-  } else if (uri != nullptr && strcmp(uri->scheme, "unix") == 0) {
+    grpc_resolved_address resolved_host;
+    grpc_error_handle error =
+        grpc_string_to_sockaddr(&resolved_host, host.c_str(), port_num);
+    if (error == GRPC_ERROR_NONE) {
+      std::string packed_host = grpc_sockaddr_get_packed_host(&resolved_host);
+      std::string b64_host = absl::Base64Escape(packed_host);
+      data["tcpip_address"] = Json::Object{
+          {"port", port_num},
+          {"ip_address", b64_host},
+      };
+      (*json)[name] = std::move(data);
+      return;
+    }
+    GRPC_ERROR_UNREF(error);
+  }
+  if (uri.ok() && uri->scheme() == "unix") {
     data["uds_address"] = Json::Object{
-        {"filename", uri->path},
+        {"filename", uri->path()},
     };
   } else {
     data["other_address"] = Json::Object{
         {"name", addr_str},
     };
   }
-  grpc_uri_destroy(uri);
   (*json)[name] = std::move(data);
 }
 
 }  // namespace
 
-SocketNode::SocketNode(std::string local, std::string remote, std::string name)
+SocketNode::SocketNode(std::string local, std::string remote, std::string name,
+                       RefCountedPtr<Security> security)
     : BaseNode(EntityType::kSocket, std::move(name)),
       local_(std::move(local)),
-      remote_(std::move(remote)) {}
+      remote_(std::move(remote)),
+      security_(std::move(security)) {}
 
 void SocketNode::RecordStreamStartedFromLocal() {
   streams_started_.FetchAdd(1, MemoryOrder::RELAXED);
@@ -503,6 +558,10 @@ Json SocketNode::RenderJson() {
        }},
       {"data", std::move(data)},
   };
+  if (security_ != nullptr &&
+      security_->type != SocketNode::Security::ModelType::kUnset) {
+    object["security"] = security_->RenderJson();
+  }
   PopulateSocketAddressJson(&object, "remote", remote_.c_str());
   PopulateSocketAddressJson(&object, "local", local_.c_str());
   return object;

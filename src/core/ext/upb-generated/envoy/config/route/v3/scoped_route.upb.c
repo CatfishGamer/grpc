@@ -19,16 +19,17 @@ static const upb_msglayout *const envoy_config_route_v3_ScopedRouteConfiguration
   &envoy_config_route_v3_ScopedRouteConfiguration_Key_msginit,
 };
 
-static const upb_msglayout_field envoy_config_route_v3_ScopedRouteConfiguration__fields[3] = {
-  {1, UPB_SIZE(0, 0), 0, 0, 9, 1},
-  {2, UPB_SIZE(8, 16), 0, 0, 9, 1},
-  {3, UPB_SIZE(16, 32), 0, 0, 11, 1},
+static const upb_msglayout_field envoy_config_route_v3_ScopedRouteConfiguration__fields[4] = {
+  {1, UPB_SIZE(4, 8), 0, 0, 9, 1},
+  {2, UPB_SIZE(12, 24), 0, 0, 9, 1},
+  {3, UPB_SIZE(20, 40), 1, 0, 11, 1},
+  {4, UPB_SIZE(1, 1), 0, 0, 8, 1},
 };
 
 const upb_msglayout envoy_config_route_v3_ScopedRouteConfiguration_msginit = {
   &envoy_config_route_v3_ScopedRouteConfiguration_submsgs[0],
   &envoy_config_route_v3_ScopedRouteConfiguration__fields[0],
-  UPB_SIZE(24, 48), 3, false,
+  UPB_SIZE(24, 48), 4, false, 255,
 };
 
 static const upb_msglayout *const envoy_config_route_v3_ScopedRouteConfiguration_Key_submsgs[1] = {
@@ -42,7 +43,7 @@ static const upb_msglayout_field envoy_config_route_v3_ScopedRouteConfiguration_
 const upb_msglayout envoy_config_route_v3_ScopedRouteConfiguration_Key_msginit = {
   &envoy_config_route_v3_ScopedRouteConfiguration_Key_submsgs[0],
   &envoy_config_route_v3_ScopedRouteConfiguration_Key__fields[0],
-  UPB_SIZE(4, 8), 1, false,
+  UPB_SIZE(8, 8), 1, false, 255,
 };
 
 static const upb_msglayout_field envoy_config_route_v3_ScopedRouteConfiguration_Key_Fragment__fields[1] = {
@@ -52,7 +53,7 @@ static const upb_msglayout_field envoy_config_route_v3_ScopedRouteConfiguration_
 const upb_msglayout envoy_config_route_v3_ScopedRouteConfiguration_Key_Fragment_msginit = {
   NULL,
   &envoy_config_route_v3_ScopedRouteConfiguration_Key_Fragment__fields[0],
-  UPB_SIZE(16, 32), 1, false,
+  UPB_SIZE(16, 32), 1, false, 255,
 };
 
 #include "upb/port_undef.inc"

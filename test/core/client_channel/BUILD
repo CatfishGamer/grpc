@@ -19,6 +19,18 @@ grpc_package(name = "test/core/client_channel")
 licenses(["notice"])
 
 grpc_cc_test(
+    name = "certificate_provider_registry_test",
+    srcs = ["certificate_provider_registry_test.cc"],
+    external_deps = ["gtest"],
+    language = "C++",
+    deps = [
+        "//:gpr",
+        "//:grpc",
+        "//test/core/util:grpc_test_util",
+    ],
+)
+
+grpc_cc_test(
     name = "retry_throttle_test",
     srcs = ["retry_throttle_test.cc"],
     external_deps = [
@@ -36,20 +48,6 @@ grpc_cc_test(
 grpc_cc_test(
     name = "service_config_test",
     srcs = ["service_config_test.cc"],
-    external_deps = [
-        "gtest",
-    ],
-    language = "C++",
-    deps = [
-        "//:gpr",
-        "//:grpc",
-        "//test/core/util:grpc_test_util",
-    ],
-)
-
-grpc_cc_test(
-    name = "xds_bootstrap_test",
-    srcs = ["xds_bootstrap_test.cc"],
     external_deps = [
         "gtest",
     ],

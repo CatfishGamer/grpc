@@ -39,7 +39,7 @@ static void add_to_write_list(grpc_chttp2_write_cb** list,
 }
 
 static void finish_write_cb(grpc_chttp2_transport* t, grpc_chttp2_stream* s,
-                            grpc_chttp2_write_cb* cb, grpc_error* error) {
+                            grpc_chttp2_write_cb* cb, grpc_error_handle error) {
   grpc_chttp2_complete_closure_step(t, s, &cb->closure, error,
                                     "finish_write_cb");
   cb->next = t->write_cb_pool;
@@ -75,14 +75,17 @@ static void maybe_initiate_ping(grpc_chttp2_transport* t) {
     }
     return;
   }
+  // InvalidateNow to avoid getting stuck re-initializing the ping timer
+  // in a loop while draining the currently-held combiner. Also see
+  // https://github.com/grpc/grpc/issues/26079.
+  grpc_core::ExecCtx::Get()->InvalidateNow();
   grpc_millis now = grpc_core::ExecCtx::Get()->Now();
 
   grpc_millis next_allowed_ping_interval =
       (t->keepalive_permit_without_calls == 0 &&
        grpc_chttp2_stream_map_size(&t->stream_map) == 0)
           ? 7200 * GPR_MS_PER_SEC
-          : (t->ping_policy.min_sent_ping_interval_without_data +
-             GPR_MS_PER_SEC); /* A second is added to deal with network delays
+          : (GPR_MS_PER_SEC); /* A second is added to deal with network delays
                                  and timing imprecision */
   grpc_millis next_allowed_ping =
       t->ping_state.last_ping_sent_time + next_allowed_ping_interval;
@@ -135,7 +138,7 @@ static void maybe_initiate_ping(grpc_chttp2_transport* t) {
 
 static bool update_list(grpc_chttp2_transport* t, grpc_chttp2_stream* s,
                         int64_t send_bytes, grpc_chttp2_write_cb** list,
-                        int64_t* ctr, grpc_error* error) {
+                        int64_t* ctr, grpc_error_handle error) {
   bool sched_any = false;
   grpc_chttp2_write_cb* cb = *list;
   *list = nullptr;
@@ -199,7 +202,7 @@ class StreamWriteContext;
 
 class WriteContext {
  public:
-  WriteContext(grpc_chttp2_transport* t) : t_(t) {
+  explicit WriteContext(grpc_chttp2_transport* t) : t_(t) {
     GRPC_STATS_INC_HTTP2_WRITES_BEGUN();
     GPR_TIMER_SCOPE("grpc_chttp2_begin_write", 0);
   }
@@ -679,7 +682,7 @@ grpc_chttp2_begin_write_result grpc_chttp2_begin_write(
   return ctx.Result();
 }
 
-void grpc_chttp2_end_write(grpc_chttp2_transport* t, grpc_error* error) {
+void grpc_chttp2_end_write(grpc_chttp2_transport* t, grpc_error_handle error) {
   GPR_TIMER_SCOPE("grpc_chttp2_end_write", 0);
   grpc_chttp2_stream* s;
 

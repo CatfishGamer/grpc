@@ -40,6 +40,7 @@
 #include <grpcpp/server_builder.h>
 
 #include "src/core/ext/filters/client_channel/resolver/fake/fake_resolver.h"
+#include "src/core/ext/transport/chttp2/transport/chttp2_transport.h"
 #include "src/core/lib/gpr/useful.h"
 #include "src/core/lib/gprpp/host_port.h"
 #include "src/core/lib/gprpp/thd.h"
@@ -49,6 +50,7 @@
 #include "src/core/lib/security/credentials/credentials.h"
 #include "src/core/lib/security/security_connector/alts/alts_security_connector.h"
 #include "src/core/lib/slice/slice_string_helpers.h"
+#include "src/core/lib/surface/channel.h"
 
 #include "test/core/util/memory_counters.h"
 #include "test/core/util/port.h"
@@ -58,7 +60,49 @@
 
 namespace {
 
-void* tag(int i) { return (void*)static_cast<intptr_t>(i); }
+class TransportCounter {
+ public:
+  static void CounterInitCallback() {
+    absl::MutexLock lock(&mu());
+    ++count_;
+  }
+
+  static void CounterDestructCallback() {
+    absl::MutexLock lock(&mu());
+    if (--count_ == 0) {
+      cv().SignalAll();
+    }
+  }
+
+  static void WaitForTransportsToBeDestroyed() {
+    absl::MutexLock lock(&mu());
+    while (count_ != 0) {
+      ASSERT_FALSE(cv().WaitWithTimeout(&mu(), absl::Seconds(10)));
+    }
+  }
+
+  static int count() {
+    absl::MutexLock lock(&mu());
+    return count_;
+  }
+
+  static absl::Mutex& mu() {
+    static absl::Mutex* mu = new absl::Mutex();
+    return *mu;
+  }
+
+  static absl::CondVar& cv() {
+    static absl::CondVar* cv = new absl::CondVar();
+    return *cv;
+  }
+
+ private:
+  static int count_;
+};
+
+int TransportCounter::count_ = 0;
+
+void* tag(intptr_t t) { return reinterpret_cast<void*>(t); }
 
 // Perform a simple RPC where the server cancels the request with
 // grpc_call_cancel_with_status
@@ -170,8 +214,8 @@ TEST(TooManyPings, TestLotsOfServerCancelledRpcsDoesntGiveTooManyPings) {
   grpc_completion_queue_shutdown(cq);
   while (grpc_completion_queue_next(cq, gpr_inf_future(GPR_CLOCK_REALTIME),
                                     nullptr)
-             .type != GRPC_QUEUE_SHUTDOWN)
-    ;
+             .type != GRPC_QUEUE_SHUTDOWN) {
+  }
   grpc_server_destroy(server);
   grpc_completion_queue_destroy(cq);
 }
@@ -245,6 +289,43 @@ grpc_status_code PerformWaitingCall(grpc_channel* channel, grpc_server* server,
   return status;
 }
 
+// Shuts down and destroys the server.
+void ServerShutdownAndDestroy(grpc_server* server, grpc_completion_queue* cq) {
+  // Shutdown and destroy server
+  grpc_server_shutdown_and_notify(server, cq, reinterpret_cast<void*>(1000));
+  while (grpc_completion_queue_next(cq, gpr_inf_future(GPR_CLOCK_REALTIME),
+                                    nullptr)
+             .tag != reinterpret_cast<void*>(1000)) {
+  }
+  grpc_server_destroy(server);
+}
+
+void VerifyChannelReady(grpc_channel* channel, grpc_completion_queue* cq) {
+  grpc_connectivity_state state =
+      grpc_channel_check_connectivity_state(channel, 1 /* try_to_connect */);
+  while (state != GRPC_CHANNEL_READY) {
+    grpc_channel_watch_connectivity_state(
+        channel, state, grpc_timeout_seconds_to_deadline(5), cq, nullptr);
+    grpc_completion_queue_next(cq, grpc_timeout_seconds_to_deadline(5),
+                               nullptr);
+    state = grpc_channel_check_connectivity_state(channel, 0);
+  }
+}
+
+void VerifyChannelDisconnected(grpc_channel* channel,
+                               grpc_completion_queue* cq) {
+  // Verify channel gets disconnected. Use a ping to make sure that clients
+  // tries sending/receiving bytes if the channel is connected.
+  grpc_channel_ping(channel, cq, reinterpret_cast<void*>(2000), nullptr);
+  grpc_event ev = grpc_completion_queue_next(
+      cq, grpc_timeout_seconds_to_deadline(5), nullptr);
+  GPR_ASSERT(ev.type == GRPC_OP_COMPLETE);
+  GPR_ASSERT(ev.tag == reinterpret_cast<void*>(2000));
+  GPR_ASSERT(ev.success == 0);
+  GPR_ASSERT(grpc_channel_check_connectivity_state(channel, 0) !=
+             GRPC_CHANNEL_READY);
+}
+
 class KeepaliveThrottlingTest : public ::testing::Test {
  protected:
   // Starts the server and makes sure that the channel is able to get connected.
@@ -267,45 +348,6 @@ class KeepaliveThrottlingTest : public ::testing::Test {
     grpc_server_start(server);
     return server;
   }
-
-  // Shuts down and destroys the server. Also, makes sure that the channel
-  // receives the disconnection event.
-  void ServerShutdownAndDestroy(grpc_server* server,
-                                grpc_completion_queue* cq) {
-    // Shutdown and destroy server
-    grpc_server_shutdown_and_notify(server, cq, (void*)(1000));
-    while (grpc_completion_queue_next(cq, gpr_inf_future(GPR_CLOCK_REALTIME),
-                                      nullptr)
-               .tag != (void*)(1000))
-      ;
-    grpc_server_destroy(server);
-  }
-
-  void VerifyChannelReady(grpc_channel* channel, grpc_completion_queue* cq) {
-    grpc_connectivity_state state =
-        grpc_channel_check_connectivity_state(channel, 1 /* try_to_connect */);
-    while (state != GRPC_CHANNEL_READY) {
-      grpc_channel_watch_connectivity_state(
-          channel, state, grpc_timeout_seconds_to_deadline(5), cq, nullptr);
-      grpc_completion_queue_next(cq, grpc_timeout_seconds_to_deadline(5),
-                                 nullptr);
-      state = grpc_channel_check_connectivity_state(channel, 0);
-    }
-  }
-
-  void VerifyChannelDisconnected(grpc_channel* channel,
-                                 grpc_completion_queue* cq) {
-    // Verify channel gets disconnected. Use a ping to make sure that clients
-    // tries sending/receiving bytes if the channel is connected.
-    grpc_channel_ping(channel, cq, (void*)(2000), nullptr);
-    grpc_event ev = grpc_completion_queue_next(
-        cq, grpc_timeout_seconds_to_deadline(5), nullptr);
-    GPR_ASSERT(ev.type == GRPC_OP_COMPLETE);
-    GPR_ASSERT(ev.tag == (void*)(2000));
-    GPR_ASSERT(ev.success == 0);
-    GPR_ASSERT(grpc_channel_check_connectivity_state(channel, 0) !=
-               GRPC_CHANNEL_READY);
-  }
 };
 
 TEST_F(KeepaliveThrottlingTest, KeepaliveThrottlingMultipleChannels) {
@@ -317,10 +359,6 @@ TEST_F(KeepaliveThrottlingTest, KeepaliveThrottlingMultipleChannels) {
   grpc_arg client_args[] = {
       grpc_channel_arg_integer_create(
           const_cast<char*>(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA), 0),
-      grpc_channel_arg_integer_create(
-          const_cast<char*>(
-              GRPC_ARG_HTTP2_MIN_SENT_PING_INTERVAL_WITHOUT_DATA_MS),
-          0),
       grpc_channel_arg_integer_create(
           const_cast<char*>(GRPC_ARG_KEEPALIVE_TIME_MS), 1 * 1000),
       grpc_channel_arg_integer_create(
@@ -358,8 +396,8 @@ TEST_F(KeepaliveThrottlingTest, KeepaliveThrottlingMultipleChannels) {
   grpc_completion_queue_shutdown(cq);
   while (grpc_completion_queue_next(cq, gpr_inf_future(GPR_CLOCK_REALTIME),
                                     nullptr)
-             .type != GRPC_QUEUE_SHUTDOWN)
-    ;
+             .type != GRPC_QUEUE_SHUTDOWN) {
+  }
   grpc_completion_queue_destroy(cq);
 }
 
@@ -367,15 +405,15 @@ grpc_core::Resolver::Result BuildResolverResult(
     const std::vector<std::string>& addresses) {
   grpc_core::Resolver::Result result;
   for (const auto& address_str : addresses) {
-    grpc_uri* uri = grpc_uri_parse(address_str.c_str(), true);
-    if (uri == nullptr) {
-      gpr_log(GPR_ERROR, "Failed to parse uri:%s", address_str.c_str());
-      GPR_ASSERT(0);
+    absl::StatusOr<grpc_core::URI> uri = grpc_core::URI::Parse(address_str);
+    if (!uri.ok()) {
+      gpr_log(GPR_ERROR, "Failed to parse uri. Error: %s",
+              uri.status().ToString().c_str());
+      GPR_ASSERT(uri.ok());
     }
     grpc_resolved_address address;
-    GPR_ASSERT(grpc_parse_uri(uri, &address));
+    GPR_ASSERT(grpc_parse_uri(*uri, &address));
     result.addresses.emplace_back(address.addr, address.len, nullptr);
-    grpc_uri_destroy(uri);
   }
   return result;
 }
@@ -400,10 +438,6 @@ TEST_F(KeepaliveThrottlingTest, NewSubchannelsUseUpdatedKeepaliveTime) {
   grpc_arg client_args[] = {
       grpc_channel_arg_integer_create(
           const_cast<char*>(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA), 0),
-      grpc_channel_arg_integer_create(
-          const_cast<char*>(
-              GRPC_ARG_HTTP2_MIN_SENT_PING_INTERVAL_WITHOUT_DATA_MS),
-          0),
       grpc_channel_arg_integer_create(
           const_cast<char*>(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS), 0),
       grpc_channel_arg_integer_create(
@@ -452,8 +486,8 @@ TEST_F(KeepaliveThrottlingTest, NewSubchannelsUseUpdatedKeepaliveTime) {
   grpc_completion_queue_shutdown(cq);
   while (grpc_completion_queue_next(cq, gpr_inf_future(GPR_CLOCK_REALTIME),
                                     nullptr)
-             .type != GRPC_QUEUE_SHUTDOWN)
-    ;
+             .type != GRPC_QUEUE_SHUTDOWN) {
+  }
   grpc_completion_queue_destroy(cq);
 }
 
@@ -473,10 +507,6 @@ TEST_F(KeepaliveThrottlingTest,
   grpc_arg client_args[] = {
       grpc_channel_arg_integer_create(
           const_cast<char*>(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA), 0),
-      grpc_channel_arg_integer_create(
-          const_cast<char*>(
-              GRPC_ARG_HTTP2_MIN_SENT_PING_INTERVAL_WITHOUT_DATA_MS),
-          0),
       grpc_channel_arg_integer_create(
           const_cast<char*>(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS), 0),
       grpc_channel_arg_integer_create(
@@ -523,8 +553,273 @@ TEST_F(KeepaliveThrottlingTest,
   grpc_completion_queue_shutdown(cq);
   while (grpc_completion_queue_next(cq, gpr_inf_future(GPR_CLOCK_REALTIME),
                                     nullptr)
-             .type != GRPC_QUEUE_SHUTDOWN)
-    ;
+             .type != GRPC_QUEUE_SHUTDOWN) {
+  }
+  grpc_completion_queue_destroy(cq);
+}
+
+// Perform a simple RPC where the client makes a request expecting a response
+// with payload.
+void PerformCallWithResponsePayload(grpc_channel* channel, grpc_server* server,
+                                    grpc_completion_queue* cq) {
+  grpc_slice response_payload_slice = grpc_slice_from_static_string("hello");
+
+  grpc_call* c;
+  grpc_call* s;
+  grpc_byte_buffer* response_payload =
+      grpc_raw_byte_buffer_create(&response_payload_slice, 1);
+  cq_verifier* cqv = cq_verifier_create(cq);
+  grpc_op ops[6];
+  grpc_op* op;
+  grpc_metadata_array initial_metadata_recv;
+  grpc_metadata_array trailing_metadata_recv;
+  grpc_metadata_array request_metadata_recv;
+  grpc_byte_buffer* response_payload_recv = nullptr;
+  grpc_call_details call_details;
+  grpc_status_code status;
+  grpc_call_error error;
+  grpc_slice details;
+  int was_cancelled = 2;
+
+  gpr_timespec deadline = grpc_timeout_seconds_to_deadline(60);
+  c = grpc_channel_create_call(channel, nullptr, GRPC_PROPAGATE_DEFAULTS, cq,
+                               grpc_slice_from_static_string("/foo"), nullptr,
+                               deadline, nullptr);
+  GPR_ASSERT(c);
+
+  grpc_metadata_array_init(&initial_metadata_recv);
+  grpc_metadata_array_init(&trailing_metadata_recv);
+  grpc_metadata_array_init(&request_metadata_recv);
+  grpc_call_details_init(&call_details);
+
+  memset(ops, 0, sizeof(ops));
+  op = ops;
+  op->op = GRPC_OP_SEND_INITIAL_METADATA;
+  op->data.send_initial_metadata.count = 0;
+  op->flags = 0;
+  op->reserved = nullptr;
+  op++;
+  op->op = GRPC_OP_SEND_CLOSE_FROM_CLIENT;
+  op->flags = 0;
+  op->reserved = nullptr;
+  op++;
+  op->op = GRPC_OP_RECV_INITIAL_METADATA;
+  op->data.recv_initial_metadata.recv_initial_metadata = &initial_metadata_recv;
+  op->flags = 0;
+  op->reserved = nullptr;
+  op++;
+  op->op = GRPC_OP_RECV_MESSAGE;
+  op->data.recv_message.recv_message = &response_payload_recv;
+  op->flags = 0;
+  op->reserved = nullptr;
+  op++;
+  op->op = GRPC_OP_RECV_STATUS_ON_CLIENT;
+  op->data.recv_status_on_client.trailing_metadata = &trailing_metadata_recv;
+  op->data.recv_status_on_client.status = &status;
+  op->data.recv_status_on_client.status_details = &details;
+  op->flags = 0;
+  op->reserved = nullptr;
+  op++;
+  error = grpc_call_start_batch(c, ops, static_cast<size_t>(op - ops), tag(1),
+                                nullptr);
+  GPR_ASSERT(GRPC_CALL_OK == error);
+
+  error = grpc_server_request_call(server, &s, &call_details,
+                                   &request_metadata_recv, cq, cq, tag(101));
+  GPR_ASSERT(GRPC_CALL_OK == error);
+  CQ_EXPECT_COMPLETION(cqv, tag(101), 1);
+  cq_verify(cqv);
+
+  memset(ops, 0, sizeof(ops));
+  op = ops;
+  op->op = GRPC_OP_SEND_INITIAL_METADATA;
+  op->data.send_initial_metadata.count = 0;
+  op->flags = 0;
+  op->reserved = nullptr;
+  op++;
+  error = grpc_call_start_batch(s, ops, static_cast<size_t>(op - ops), tag(102),
+                                nullptr);
+  GPR_ASSERT(GRPC_CALL_OK == error);
+
+  CQ_EXPECT_COMPLETION(cqv, tag(102), 1);
+  cq_verify(cqv);
+
+  memset(ops, 0, sizeof(ops));
+  op = ops;
+  op->op = GRPC_OP_RECV_CLOSE_ON_SERVER;
+  op->data.recv_close_on_server.cancelled = &was_cancelled;
+  op->flags = 0;
+  op->reserved = nullptr;
+  op++;
+  op->op = GRPC_OP_SEND_MESSAGE;
+  op->data.send_message.send_message = response_payload;
+  op->flags = 0;
+  op->reserved = nullptr;
+  op++;
+  op->op = GRPC_OP_SEND_STATUS_FROM_SERVER;
+  op->data.send_status_from_server.trailing_metadata_count = 0;
+  op->data.send_status_from_server.status = GRPC_STATUS_OK;
+  grpc_slice status_details = grpc_slice_from_static_string("xyz");
+  op->data.send_status_from_server.status_details = &status_details;
+  op->flags = 0;
+  op->reserved = nullptr;
+  op++;
+  error = grpc_call_start_batch(s, ops, static_cast<size_t>(op - ops), tag(103),
+                                nullptr);
+  GPR_ASSERT(GRPC_CALL_OK == error);
+
+  CQ_EXPECT_COMPLETION(cqv, tag(103), 1);
+  CQ_EXPECT_COMPLETION(cqv, tag(1), 1);
+  cq_verify(cqv);
+
+  GPR_ASSERT(status == GRPC_STATUS_OK);
+  GPR_ASSERT(0 == grpc_slice_str_cmp(details, "xyz"));
+  GPR_ASSERT(0 == grpc_slice_str_cmp(call_details.method, "/foo"));
+  GPR_ASSERT(was_cancelled == 0);
+  GPR_ASSERT(
+      byte_buffer_eq_slice(response_payload_recv, response_payload_slice));
+
+  grpc_slice_unref(details);
+  grpc_metadata_array_destroy(&initial_metadata_recv);
+  grpc_metadata_array_destroy(&trailing_metadata_recv);
+  grpc_metadata_array_destroy(&request_metadata_recv);
+  grpc_call_details_destroy(&call_details);
+
+  grpc_call_unref(c);
+  grpc_call_unref(s);
+
+  cq_verifier_destroy(cqv);
+
+  grpc_byte_buffer_destroy(response_payload);
+  grpc_byte_buffer_destroy(response_payload_recv);
+}
+
+TEST(TooManyPings, BdpPingNotSentWithoutReceiveSideActivity) {
+  grpc_completion_queue* cq = grpc_completion_queue_create_for_next(nullptr);
+  // create the server
+  std::string server_address =
+      grpc_core::JoinHostPort("localhost", grpc_pick_unused_port_or_die());
+  grpc_arg server_args[] = {
+      grpc_channel_arg_integer_create(
+          const_cast<char*>(
+              GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS),
+          60 * 1000),
+      grpc_channel_arg_integer_create(
+          const_cast<char*>(GRPC_ARG_HTTP2_MAX_PING_STRIKES), 1)};
+  grpc_channel_args server_channel_args = {GPR_ARRAY_SIZE(server_args),
+                                           server_args};
+  grpc_server* server = grpc_server_create(&server_channel_args, nullptr);
+  grpc_server_register_completion_queue(server, cq, nullptr);
+  GPR_ASSERT(
+      grpc_server_add_insecure_http2_port(server, server_address.c_str()));
+  grpc_server_start(server);
+  // create the channel (bdp pings are enabled by default)
+  grpc_arg client_args[] = {
+      grpc_channel_arg_integer_create(
+          const_cast<char*>(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA), 0),
+      grpc_channel_arg_integer_create(
+          const_cast<char*>(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS), 1)};
+  grpc_channel_args client_channel_args = {GPR_ARRAY_SIZE(client_args),
+                                           client_args};
+  grpc_channel* channel = grpc_insecure_channel_create(
+      server_address.c_str(), &client_channel_args, nullptr);
+  VerifyChannelReady(channel, cq);
+  EXPECT_EQ(TransportCounter::count(), 2 /* one each for server and client */);
+  cq_verifier* cqv = cq_verifier_create(cq);
+  // Channel should be able to send two pings without disconnect if there was no
+  // BDP sent.
+  grpc_channel_ping(channel, cq, tag(1), nullptr);
+  CQ_EXPECT_COMPLETION(cqv, tag(1), 1);
+  cq_verify(cqv, 5);
+  // Second ping
+  grpc_channel_ping(channel, cq, tag(2), nullptr);
+  CQ_EXPECT_COMPLETION(cqv, tag(2), 1);
+  cq_verify(cqv, 5);
+  ASSERT_EQ(grpc_channel_check_connectivity_state(channel, 0),
+            GRPC_CHANNEL_READY);
+  PerformCallWithResponsePayload(channel, server, cq);
+  // Wait a bit to make sure that the BDP ping goes out.
+  cq_verify_empty_timeout(cqv, 1);
+  // The call with a response payload should have triggered a BDP ping.
+  // Send two more pings to verify. The second ping should cause a disconnect.
+  // If BDP was not sent, the second ping would not cause a disconnect.
+  grpc_channel_ping(channel, cq, tag(3), nullptr);
+  CQ_EXPECT_COMPLETION(cqv, tag(3), 1);
+  cq_verify(cqv, 5);
+  // Second ping
+  grpc_channel_ping(channel, cq, tag(4), nullptr);
+  CQ_EXPECT_COMPLETION(cqv, tag(4), 1);
+  cq_verify(cqv, 5);
+  // Make sure that the transports have been destroyed
+  VerifyChannelDisconnected(channel, cq);
+  TransportCounter::WaitForTransportsToBeDestroyed();
+  cq_verifier_destroy(cqv);
+  // shutdown and destroy the client and server
+  ServerShutdownAndDestroy(server, cq);
+  grpc_channel_destroy(channel);
+  grpc_completion_queue_shutdown(cq);
+  while (grpc_completion_queue_next(cq, gpr_inf_future(GPR_CLOCK_REALTIME),
+                                    nullptr)
+             .type != GRPC_QUEUE_SHUTDOWN) {
+  }
+  grpc_completion_queue_destroy(cq);
+}
+
+TEST(TooManyPings, TransportsGetCleanedUpOnDisconnect) {
+  grpc_completion_queue* cq = grpc_completion_queue_create_for_next(nullptr);
+  // create the client and server
+  std::string server_address =
+      grpc_core::JoinHostPort("localhost", grpc_pick_unused_port_or_die());
+  grpc_arg server_args[] = {
+      grpc_channel_arg_integer_create(
+          const_cast<char*>(
+              GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS),
+          60 * 1000),
+      grpc_channel_arg_integer_create(
+          const_cast<char*>(GRPC_ARG_HTTP2_MAX_PING_STRIKES), 1)};
+  grpc_channel_args server_channel_args = {GPR_ARRAY_SIZE(server_args),
+                                           server_args};
+  grpc_server* server = grpc_server_create(&server_channel_args, nullptr);
+  grpc_server_register_completion_queue(server, cq, nullptr);
+  GPR_ASSERT(
+      grpc_server_add_insecure_http2_port(server, server_address.c_str()));
+  grpc_server_start(server);
+  grpc_arg client_args[] = {
+      grpc_channel_arg_integer_create(
+          const_cast<char*>(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA), 0),
+      grpc_channel_arg_integer_create(
+          const_cast<char*>(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS), 1)};
+  grpc_channel_args client_channel_args = {GPR_ARRAY_SIZE(client_args),
+                                           client_args};
+  grpc_channel* channel = grpc_insecure_channel_create(
+      server_address.c_str(), &client_channel_args, nullptr);
+  VerifyChannelReady(channel, cq);
+  EXPECT_EQ(TransportCounter::count(), 2 /* one each for server and client */);
+  cq_verifier* cqv = cq_verifier_create(cq);
+  // First ping
+  grpc_channel_ping(channel, cq, tag(1), nullptr);
+  CQ_EXPECT_COMPLETION(cqv, tag(1), 1);
+  cq_verify(cqv, 5);
+  // Second ping
+  grpc_channel_ping(channel, cq, tag(2), nullptr);
+  CQ_EXPECT_COMPLETION(cqv, tag(2), 1);
+  cq_verify(cqv, 5);
+  // Third ping caused disconnect
+  grpc_channel_ping(channel, cq, tag(2), nullptr);
+  CQ_EXPECT_COMPLETION(cqv, tag(2), 1);
+  cq_verify(cqv, 5);
+  // Make sure that the transports have been destroyed
+  VerifyChannelDisconnected(channel, cq);
+  TransportCounter::WaitForTransportsToBeDestroyed();
+  cq_verifier_destroy(cqv);
+  // shutdown and destroy the client and server
+  ServerShutdownAndDestroy(server, cq);
+  grpc_channel_destroy(channel);
+  grpc_completion_queue_shutdown(cq);
+  while (grpc_completion_queue_next(cq, gpr_inf_future(GPR_CLOCK_REALTIME),
+                                    nullptr)
+             .type != GRPC_QUEUE_SHUTDOWN) {
+  }
   grpc_completion_queue_destroy(cq);
 }
 
@@ -533,6 +828,10 @@ TEST_F(KeepaliveThrottlingTest,
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   grpc::testing::TestEnvironment env(argc, argv);
+  grpc_core::TestOnlySetGlobalHttp2TransportInitCallback(
+      TransportCounter::CounterInitCallback);
+  grpc_core::TestOnlySetGlobalHttp2TransportDestructCallback(
+      TransportCounter::CounterDestructCallback);
   grpc_init();
   auto result = RUN_ALL_TESTS();
   grpc_shutdown();

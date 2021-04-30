@@ -355,9 +355,10 @@ class CLanguage(object):
                             tests = subprocess.check_output(
                                 [binary, '--benchmark_list_tests'],
                                 stderr=fnull)
-                        for line in tests.split('\n'):
+                        for line in tests.decode().split('\n'):
                             test = line.strip()
-                            if not test: continue
+                            if not test:
+                                continue
                             cmdline = [binary,
                                        '--benchmark_filter=%s$' % test
                                       ] + target['args']
@@ -380,10 +381,12 @@ class CLanguage(object):
                             tests = subprocess.check_output(
                                 [binary, '--gtest_list_tests'], stderr=fnull)
                         base = None
-                        for line in tests.split('\n'):
+                        for line in tests.decode().split('\n'):
                             i = line.find('#')
-                            if i >= 0: line = line[:i]
-                            if not line: continue
+                            if i >= 0:
+                                line = line[:i]
+                            if not line:
+                                continue
                             if line[0] != ' ':
                                 base = line.strip()
                             else:
@@ -484,14 +487,14 @@ class CLanguage(object):
             return ('buster', [])
         elif compiler == 'gcc_musl':
             return ('alpine', [])
-        elif compiler == 'clang3.6':
+        elif compiler == 'clang4.0':
             return ('ubuntu1604',
                     self._clang_cmake_configure_extra_args(
-                        version_suffix='-3.6'))
-        elif compiler == 'clang3.7':
+                        version_suffix='-4.0'))
+        elif compiler == 'clang5.0':
             return ('ubuntu1604',
                     self._clang_cmake_configure_extra_args(
-                        version_suffix='-3.7'))
+                        version_suffix='-5.0'))
         else:
             raise Exception('Compiler %s not supported.' % compiler)
 
@@ -571,46 +574,6 @@ class RemoteNodeLanguage(object):
         return 'grpc-node'
 
 
-class PhpLanguage(object):
-
-    def configure(self, config, args):
-        self.config = config
-        self.args = args
-        _check_compiler(self.args.compiler, ['default'])
-        self._make_options = ['EMBED_OPENSSL=true', 'EMBED_ZLIB=true']
-
-    def test_specs(self):
-        return [
-            self.config.job_spec(['src/php/bin/run_tests.sh'],
-                                 environ=_FORCE_ENVIRON_FOR_WRAPPERS)
-        ]
-
-    def pre_build_steps(self):
-        return []
-
-    def make_targets(self):
-        return ['static_c', 'shared_c']
-
-    def make_options(self):
-        return self._make_options
-
-    def build_steps(self):
-        return [['tools/run_tests/helper_scripts/build_php.sh']]
-
-    def post_tests_steps(self):
-        return [['tools/run_tests/helper_scripts/post_tests_php.sh']]
-
-    def makefile_name(self):
-        return 'Makefile'
-
-    def dockerfile_dir(self):
-        return 'tools/dockerfile/test/php_jessie_%s' % _docker_arch_suffix(
-            self.args.arch)
-
-    def __str__(self):
-        return 'php'
-
-
 class Php7Language(object):
 
     def configure(self, config, args):
@@ -688,7 +651,7 @@ class PythonLanguage(object):
         return [
             self.config.job_spec(
                 config.run,
-                timeout_seconds=5 * 60,
+                timeout_seconds=8 * 60,
                 environ=dict(GRPC_PYTHON_TESTRUNNER_FILTER=str(suite_name),
                              **environment),
                 shortname='%s.%s.%s' %
@@ -834,7 +797,6 @@ class PythonLanguage(object):
                     # tested.
                     return (
                         python27_config,
-                        python37_config,
                         python38_config,
                     )
                 else:
@@ -934,7 +896,7 @@ class RubyLanguage(object):
         return 'Makefile'
 
     def dockerfile_dir(self):
-        return 'tools/dockerfile/test/ruby_jessie_%s' % _docker_arch_suffix(
+        return 'tools/dockerfile/test/ruby_buster_%s' % _docker_arch_suffix(
             self.args.arch)
 
     def __str__(self):
@@ -1141,7 +1103,7 @@ class ObjCLanguage(object):
         out.append(
             self.config.job_spec(
                 ['test/core/iomgr/ios/CFStreamTests/build_and_run_tests.sh'],
-                timeout_seconds=20 * 60,
+                timeout_seconds=60 * 60,
                 shortname='ios-test-cfstream-tests',
                 cpu_cost=1e6,
                 environ=_FORCE_ENVIRON_FOR_WRAPPERS))
@@ -1178,7 +1140,7 @@ class ObjCLanguage(object):
                                  environ={'SCHEME': 'PerfTestsPosix'}))
         out.append(
             self.config.job_spec(['test/cpp/ios/build_and_run_tests.sh'],
-                                 timeout_seconds=30 * 60,
+                                 timeout_seconds=60 * 60,
                                  shortname='ios-cpp-test-cronet',
                                  cpu_cost=1e6,
                                  environ=_FORCE_ENVIRON_FOR_WRAPPERS))
@@ -1289,7 +1251,6 @@ _LANGUAGES = {
     'c++': CLanguage('cxx', 'c++'),
     'c': CLanguage('c', 'c'),
     'grpc-node': RemoteNodeLanguage(),
-    'php': PhpLanguage(),
     'php7': Php7Language(),
     'python': PythonLanguage(),
     'ruby': RubyLanguage(),
@@ -1366,7 +1327,8 @@ def runs_per_test_type(arg_str):
         return 0
     try:
         n = int(arg_str)
-        if n <= 0: raise ValueError
+        if n <= 0:
+            raise ValueError
         return n
     except:
         msg = '\'{}\' is not a positive integer or \'inf\''.format(arg_str)
@@ -1463,8 +1425,8 @@ argp.add_argument(
         'gcc7.4',
         'gcc8.3',
         'gcc_musl',
-        'clang3.6',
-        'clang3.7',
+        'clang4.0',
+        'clang5.0',
         'python2.7',
         'python3.5',
         'python3.6',
